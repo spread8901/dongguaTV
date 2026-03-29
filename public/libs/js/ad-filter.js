@@ -600,27 +600,106 @@
 
     /**
      * 独立分析 M3U8 流地址，检测广告时间段
-     * 不修改 HLS.js 的任何行为，仅通过独立 fetch 分析
+     * 完全不干扰 HLS.js —— 通过 fetch() 独立下载并解析 M3U8
      */
-    async function analyzeStreamUrl(streamUrl) {
-        if (!AD_FILTER_CONFIG.enabled || !streamUrl) return;
+    async function analyzeStreamUrl(url) {
+        if (!AD_FILTER_CONFIG.enabled) {
+            console.log('[广告过滤] ⚠️ 广告过滤已禁用，跳过分析');
+            return;
+        }
+        
+        // 重置广告时间段
+        window._adSkipRanges = null;
         
         try {
-            log('🔍 独立分析 M3U8: ' + streamUrl);
-            // 重置广告时间段
-            window._adSkipRanges = null;
+            console.log(`[广告过滤] 🔍 开始分析 M3U8: ${url.substring(0, 100)}...`);
             
-            const response = await fetch(streamUrl);
-            if (!response.ok) return;
-            const content = await response.text();
+            // 1. 获取主播放列表
+            let masterResp;
+            try {
+                masterResp = await fetch(url, { mode: 'cors' });
+            } catch (fetchErr) {
+                console.warn(`[广告过滤] ⚠️ M3U8 fetch 失败 (可能CORS限制): ${fetchErr.message}`);
+                // 尝试无 CORS 模式
+                try {
+                    masterResp = await fetch(url, { mode: 'no-cors' });
+                    console.warn('[广告过滤] ⚠️ no-cors 模式无法读取响应内容，广告检测跳过');
+                    return;
+                } catch (e2) {
+                    console.warn('[广告过滤] ⚠️ M3U8 完全无法访问，广告检测跳过');
+                    return;
+                }
+            }
             
-            if (!content.includes('#EXTM3U')) return;
+            if (!masterResp.ok) {
+                console.warn(`[广告过滤] ❌ 获取 M3U8 失败: HTTP ${masterResp.status}`);
+                return;
+            }
+            const masterText = await masterResp.text();
+            console.log(`[广告过滤] 📄 M3U8 内容长度: ${masterText.length} 字符`);
             
-            const result = detectAdTimeRanges(content);
+            // 2. 判断是主播放列表还是直接的分段列表
+            let levelText = masterText;
+            
+            if (masterText.includes('#EXT-X-STREAM-INF')) {
+                // 是主播放列表，需要提取 level URL
+                console.log('[广告过滤] 📋 检测到主播放列表 (多码率)，提取 level URL...');
+                const lines = masterText.split('\n');
+                let levelUrl = null;
+                for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+                        // 下一行是 level URL
+                        for (let j = i + 1; j < lines.length; j++) {
+                            const nextLine = lines[j].trim();
+                            if (nextLine && !nextLine.startsWith('#')) {
+                                levelUrl = nextLine;
+                                break;
+                            }
+                        }
+                        break;  // 只取第一个 variant
+                    }
+                }
+                
+                if (!levelUrl) {
+                    console.warn('[广告过滤] ❌ 未找到 level URL');
+                    return;
+                }
+                
+                // 处理相对路径
+                if (!levelUrl.startsWith('http')) {
+                    const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
+                    levelUrl = baseUrl + levelUrl;
+                }
+                
+                console.log(`[广告过滤] 🔍 获取 level 播放列表: ${levelUrl.substring(0, 100)}...`);
+                try {
+                    const levelResp = await fetch(levelUrl);
+                    if (!levelResp.ok) {
+                        console.warn(`[广告过滤] ❌ 获取 level M3U8 失败: HTTP ${levelResp.status}`);
+                        return;
+                    }
+                    levelText = await levelResp.text();
+                } catch (levelErr) {
+                    console.warn(`[广告过滤] ⚠️ level M3U8 fetch 失败: ${levelErr.message}`);
+                    return;
+                }
+            }
+            
+            // 3. 分析 level 播放列表，检测广告时间段
+            const result = detectAdTimeRanges(levelText);
+            
             if (result.adRanges.length > 0) {
                 window._adSkipRanges = result.adRanges;
-                log(`🎯 检测到 ${result.adRanges.length} 个广告时间段，总时长 ${result.adsDuration.toFixed(0)}秒`);
+                console.log(`[广告过滤] 🎯 检测到 ${result.adRanges.length} 个广告时间段，总时长 ${result.adsDuration.toFixed(0)}秒`);
+                result.adRanges.forEach((range, i) => {
+                    const startMin = Math.floor(range.start / 60);
+                    const startSec = Math.floor(range.start % 60);
+                    const endMin = Math.floor(range.end / 60);
+                    const endSec = Math.floor(range.end % 60);
+                    console.log(`[广告过滤]    广告 #${i + 1}: ${startMin}分${startSec}秒 ~ ${endMin}分${endSec}秒 (${(range.end - range.start).toFixed(1)}秒)`);
+                });
                 
+                // 显示通知
                 if (AD_FILTER_CONFIG.showNotification) {
                     setTimeout(() => {
                         if (window.dp && window.dp.notice) {
@@ -629,14 +708,16 @@
                     }, 1000);
                 }
                 
+                // 更新统计
                 stats.totalAdsFiltered += result.adsRemoved;
                 stats.totalAdDuration += result.adsDuration;
                 stats.sessionsFiltered++;
             } else {
-                log('✅ 未检测到广告段');
+                console.log('[广告过滤] ✅ 未检测到广告');
             }
+            
         } catch (e) {
-            log('⚠️ M3U8 分析失败: ' + e.message);
+            console.error('[广告过滤] ❌ analyzeStreamUrl 异常:', e);
         }
     }
 
@@ -872,15 +953,14 @@
         },
         // 导出 initUI 供外部调用 (如 index.html 中的设置菜单监听)
         initUI: injectAdFilterUI,
-        // 导出独立分析函数供 index.html 在 HLS 初始化时调用
-        analyzeStreamUrl: analyzeStreamUrl
+        // 独立分析 M3U8 流地址（由 index.html 在 HLS 加载后调用）
+        analyzeStreamUrl
     };
 
     // 初始化
     log('🚀 广告过滤模块 v2.0 加载中...');
     loadSettings();
-    // hookHlsLoader 已移除 — 不再使用自定义 loader
-    // analyzeStreamUrl 由 index.html 在创建 HLS 实例后独立调用
+    // 注意：analyzeStreamUrl 由 index.html 在 HLS 加载视频时调用，不在此处自动执行
     setupTimeBasedSkip();
     createSettingsUI();
 
